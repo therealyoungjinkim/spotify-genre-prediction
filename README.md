@@ -5,8 +5,9 @@ this project uses a naive assumption that songs could only exist in 1 genre, or 
 
 # files
 
-spotify genre classification.rmd - current code ran
-project.dat - current data, 334 songs
+-spotify genre classification.rmd - current code ran
+
+-project.dat - current data, 334 songs
 
 # pipeline
 
