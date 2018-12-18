@@ -1,0 +1,501 @@
+---
+title: "spotify genre predictions"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, r-setup, warning=F, message=F, echo=T, results="markup"}
+library(MASS)
+library(httr)
+library(jsonlite)
+library(knitr)
+library(car)
+library(tidyverse)
+```
+
+## Initialization
+
+Setup the API credentials to scrape our data from Spotify.
+
+``` {r, api-setup} 
+myId <- "320f39b48a7946319c7040d2f877e257" 
+mySecret <- "5487fde2cc5349ad902d58a908752995"
+
+response <- POST(
+  'https://accounts.spotify.com/api/token',
+  accept_json(),
+  authenticate(myId,mySecret),
+  body = list(grant_type = "client_credentials"),
+  encode = "form"
+)
+
+myToken <- content(response)$access_token
+
+myHeader <- paste0('Bearer ', myToken)
+```
+
+Write a function to scrape song ID's from playlists.
+
+```{r, trackScrape function}
+# for getting the tracks from playlist
+trackScrape <- function(playlist, genre="NA") {
+  output <- NULL
+  URI <- paste0("https://api.spotify.com/v1/playlists/", playlist, "/tracks")
+  dat <- content(GET(URI, add_headers(Authorization = myHeader)))
+  for (i in 1:dat$total){
+    id <- dat$items[[i]]$track$id
+    title <- dat$items[[i]]$track$name
+    artist <- dat$items[[i]]$track$artists[[1]]$name
+    output <- rbind(output,c(id,title,artist,genre))
+  }
+  colnames(output)=c("ID","Title","Artist","Genre")
+  output
+} 
+```
+
+Write a function to scrape song features from ID's.
+
+```{r, featureScrape function}
+# for getting the features of tracks
+featureScrape <- function(tracks) {
+  output <- NULL
+  URI <- paste0("https://api.spotify.com/v1/audio-features/?ids=", paste(tracks[,1],collapse=","))
+  dat <- content(GET(URI, add_headers(Authorization = myHeader)))$audio_features
+  for (i in 1:nrow(tracks)){
+    output <- rbind(output,as.data.frame(dat[[i]]))
+  }
+# only want columns 1 2 4 6:8 10 11 17  
+  output <- cbind(tracks[,2:3],output[,c(1,2,4,6:8,10,11,17)],tracks[,4])
+  colnames(output)[12] <- "Genre"
+  output
+}
+```
+
+Combine the two functions so we just feed it playlists to get the features of each song.
+
+```{r, myScrape function}
+# combine the two for fun times
+myScrape <- function(playlist, genre="NA") {
+  output <- NULL
+  for (i in 1:length(playlist)){
+    Tracks <- trackScrape(playlist[i], genre[i])
+    Features <- featureScrape(Tracks)
+    output <- rbind(output, Features)
+  }
+  output
+}
+```
+
+Scrape the data using our functions and write them to files for ease of use in the future.
+
+```{r, dataset creation, echo = F, eval = F}
+pop.list <- "6lXAHzJaMNTmEhWm3Wk5Qr"
+kpop.list <- "6K5LCPJtDmddD5pTNp5KRD"
+old.list <- "7I6AKVkiaZS8Ih8KE50dvB"
+rock.list <- "1LNujkCkKz4VSN9wc7h6Au"
+country.list <- "7mpQKYCqlDc0W1PFPqfXdV"
+class.list <- "6aZe42NMzR0PEwX82X0DUa"
+rap.list <- "2bKotyC4JNjEnhIY6nKvuw"
+edm.list <- "6XeEpxLG2c69yi1R9moDKv"
+
+# setup for the function
+full.list <- c(pop.list, kpop.list, old.list, rock.list, country.list, class.list, rap.list, edm.list)
+full.genre <- c("Pop","K-Pop","Oldies","Rock","Country","Classical","Rap","EDM")
+
+# scrape the data
+dat <- myScrape(full.list, full.genre)
+dat$duration_ms <- dat$duration_ms/1000 # turn from ms to seconds. also forces class to dbl for QOL
+names(dat)[names(dat)=="duration_ms"] <- "duration" # no longer in ms
+dat$Title <- str_trunc(as.character(dat$Title), 30) # truncate song names...
+dat$Artist <- str_trunc(as.character(dat$Artist), 20) # ...and artists
+
+# write the data so we don't have to scrape in the future.
+write.table(dat, file = "project.dat", row.names = F)
+```
+
+Read and subset the data into 3 groups:
+
+1. Partial data which holds all the songs but does not specify the subgroups for Pop
+2. Pop data which holds only songs from the Pop subgroups
+3. Full data which holds all the songs and does specify the subgroups for Pop
+
+```{r, read and subset our data}
+dat0 <- as.tibble(read.table("project.dat",h=T)) # read as tibble for use of dplyr library
+
+# subset our data
+artist.dat <- dat0[,1:2] # put songs and artists in separate variable for QOL
+full.dat <- dat0[,-c(1:2)] # remove songs and artists from data for QOL
+partial.dat <- full.dat # partial.dat will be with all Pop subgenres combined
+partial.dat$Genre[partial.dat$Genre %in% c("Pop","K-Pop","Oldies")] <- "Pop" # combine the Pop subgroups
+pop.dat <- full.dat[full.dat$Genre %in% c("Pop","K-Pop","Oldies"),] # data using only the Pop subgenres
+```
+## EDA
+
+In order to get a correlation matrix that sorts rows by distance it takes some work:
+
+```{r, melter function and outputs}
+melter <- function(dat) {
+  # reordering equation gathered online from here...
+  dd <- as.dist((1-dat)/2)
+  hc <- hclust(dd)
+  dat <- dat[hc$order, hc$order]
+  # ... until here
+  dat[lower.tri(dat)] <- NA
+  dimension <- nrow(dat)
+  datnames <- rownames(dat)
+  output <- data.frame(v1 = factor(datnames, ordered = T, levels = datnames), v2 = factor(datnames, ordered = T, levels = datnames), cor = 1:dimension)[0,] # ordered bc of ggplot's geom_tile function
+  for (i in 1:nrow(dat)){
+    for (j in i:nrow(dat)){
+      output[nrow(output)+1,] <- c(datnames[i], datnames[j], as.double(dat[i,j]))
+    }
+  }
+  output[,3] <- as.double(output[,3])
+  output
+}
+
+cor.dat <- melter(cor(partial.dat[,-10]))
+
+ggplot(cor.dat , aes(x = v1, y = v2, fill = cor, label = round(cor,3))) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1,1), name = "Correlation") +
+  geom_text(aes(size = abs(cor)), show.legend = F) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    axis.ticks = element_blank(),
+    legend.direction = "horizontal",
+    legend.position = c(.8,.1))
+```
+
+```{r, comparisons amongst genres}
+aggregate(full.dat[,-10], by=full.dat['Genre'], FUN=mean)
+aggregate(partial.dat[,-10], by=partial.dat['Genre'], FUN=mean)
+aggregate(pop.dat[,-10], by=pop.dat['Genre'], FUN=mean)
+```
+
+## LDA
+
+basic lda work
+
+```{r, lda stats}
+full.lda <- lda(Genre~.,dat=full.dat)
+partial.lda <- lda(Genre~.,dat=partial.dat)
+kable(round(full.lda$means,4))
+
+ggplot(data = as.data.frame(predict(full.lda)$x),mapping=aes(x=LD1, y=LD2)) +
+  geom_point(mapping=aes(color=full.dat$Genre)) +
+  scale_color_discrete(name="Genre") +
+  ggtitle("Full Model LDA Predictions")
+
+ggplot(data = as.data.frame(predict(partial.lda)$x),mapping=aes(x=LD1, y=LD2)) +
+  geom_point(mapping=aes(color=partial.dat$Genre)) +
+  scale_color_discrete(name="Genre") +
+  ggtitle("Partial Model LDA Predictions")
+```
+
+check the accuracy of our models:
+
+```{r, checking accuracies}
+confusion.full <- table(Actual=full.dat$Genre,Predicted=predict(full.lda)$class)
+confusion.partial <- table(Actual=partial.dat$Genre,Predicted=predict(partial.lda)$class)[-c(4:5),-c(4:5)]
+cbind(confusion.full,Acc=round(diag(confusion.full)/rowSums(confusion.full),3))
+cbind(confusion.partial,Acc=round(diag(confusion.partial)/rowSums(confusion.partial),3))
+round(c(sum(diag(confusion.full))/nrow(full.dat),sum(diag(confusion.partial))/nrow(partial.dat)),3) # accuracy rate, full vs partial
+
+```
+
+i want to try something similar to a discrepancy/distance chart for the full model to create a distance map thing
+
+this probably doesn't really make sense but do it for fun
+
+```{r, try making a distance using confusion + t(confusion) for full}
+par(mfrow=c(1,2))
+distance.full <- sqrt(confusion.full + t(confusion.full))
+distance.full <- (distance.full-diag(distance.full))/diag(distance.full)
+fit.full <- cmdscale(distance.full,eig=T,k=2)
+plot(fit.full$points,pch=0, type="n", xlim=c(-1,1),ylim=c(-1,1),main="Full Model")
+text(fit.full$points,row.names(fit.full$points),offset=4)
+
+distance.partial <- sqrt(confusion.partial + t(confusion.partial))
+distance.partial <- (distance.partial-diag(distance.partial))/diag(distance.partial)
+fit.partial <- cmdscale(distance.partial,eig=T,k=2)
+plot(fit.partial$points,pch=0, type="n", xlim=c(-1,1),ylim=c(-1,1),main="Partial Model")
+text(fit.partial$points,row.names(fit.partial$points),offset=4)
+```
+
+want to use just subset our data into training and testing data for predictions. decide not to use priors: the distribution i created is not indicative at all of the actual distribution (should this model ever be used with new songs)
+
+```{r, LDA function}
+myLDA <- function(data, n = 30, seed=8675309) {
+  set.seed(seed)
+  
+  testindex <- sample(nrow(data),n)
+  testdat <- data[testindex,]
+  dat <- data[-testindex,]
+  
+  output <- lda(Genre~.,dat)
+  
+  output <- cbind(artist.dat[testindex,],predict(output, newdata=testdat)$class,data$Genre[testindex])
+  output <- cbind(output,output[,3] == output[,4])
+  colnames(output)[3:5] <- c("Predicted", "Actual", "Accuracy")
+  output
+}
+```
+
+using our function, want to compare if full better than partial. first make a function for easy comparing
+
+```{r, LDA comparing function}
+LDAcompare <- function(lda1,lda2){ # assumes same seed and underlying observations for lda1 and lda2
+  output <- cbind(lda1[,1:4],lda2[,3:4],Accuracy=NA)
+  val1 <- as.numeric(lda1[,5])
+  val2 <- as.numeric(lda2[,5])*2
+  output$Accuracy[val1+val2==0] <- "None"
+  output$Accuracy[val1+val2==1] <- "LDA1"
+  output$Accuracy[val1+val2==2] <- "LDA2"
+  output$Accuracy[val1+val2==3] <- "Both"
+  colnames(output)[c(3,5)] <- c("LDA1","LDA2")
+  output
+}
+```
+
+```{r, LDA random testing}
+myseed=sample(1:10000,1) # so we can have the same test data for both partial and full models
+
+partial.lda <- myLDA(partial.dat, seed=myseed)
+full.lda <- myLDA(full.dat, seed=myseed)
+pop.lda <- myLDA(pop.dat, n=10, seed=myseed)
+
+mysums <- c(sum(partial.lda$Accuracy),sum(full.lda$Accuracy))
+mypcts <- round(mysums/c(nrow(partial.lda),nrow(full.lda)),4)
+mytable <- rbind(no.Correct=mysums,pct.Correct=mypcts)
+
+kable(LDAcompare(partial.lda,full.lda))
+mytable
+```
+
+write a similar testing function for just the partial and full model but for an even distribution of genres in the sample
+
+```{r, LDA2 function}
+myLDA2 <- function(data, triplet=1, seed=8675309) { #take out multiples of 3 due to 3 subsets of Pop
+  set.seed(seed)
+  
+  genres <- levels(full.dat$Genre)
+  testindex <- NULL
+  
+  for (i in 1:length(genres)){
+    if (genres[i] %in% c("Pop","K-Pop","Oldies")){
+      testindex <- c(testindex,sample(which(full.dat$Genre==genres[i]),triplet))
+    } else {
+      testindex <- c(testindex,sample(which(full.dat$Genre==genres[i]),triplet*3))
+    }
+  }
+
+  testdat <- data[testindex,]
+  dat <- data[-testindex,]
+  
+  output <- lda(Genre~.,dat)
+  
+  output <- cbind(artist.dat[testindex,],predict(output, newdata=testdat)$class,data$Genre[testindex])
+  output <- cbind(output,output[,3] == output[,4])
+  colnames(output)[3:5] <- c("Predicted", "Actual", "Accuracy")
+  output
+}
+```
+
+```{r, LDA2 random testing}
+myseed=sample(1:10000,1) # so we can have the same test data for both partial and full models
+
+partial.lda <- myLDA2(partial.dat, triplet=2, seed=myseed) # make sure 'triplet' param same for both
+full.lda <- myLDA2(full.dat, triplet=2, seed=myseed)
+
+mysums <- c(sum(partial.lda$Accuracy),sum(full.lda$Accuracy))
+mypcts <- round(mysums/c(nrow(partial.lda),nrow(full.lda)),4)
+mytable <- rbind(no.Correct=mysums,pct.Correct=mypcts)
+
+kable(LDAcompare(partial.lda,full.lda))
+mytable
+```
+
+some interesting observations:
+ 1. ironically the partial model is more accurate in predicting Pop. this is because there are 1/3 as many options for the partial model. usually when the partial model were to be correct, the full model just happens to guess the wrong subgenre of Pop; in a few cases the full model will guess Rock or EDM
+    + eg "P.Y.T. (Pretty Young Thing)" by Michael Jackson (Pop/Oldies) is classified correctly as Pop by the partial model, but incorrectly as K-Pop by the full model.
+    + eg "Rock Your Body" by Justin Timberlake (Pop/Contemporary) is correctly classified as Pop by the partial model, but incorrectly as Rock by the full model.
+ 2a. however, the full model is much more likely to disagree with the partial model when it incorrectly predicts a song to be Pop
+    + eg "Hot In Herre" by Nelly (Rap) is incorrectly classified as Pop by the partial model, but correctly classified by the full model.
+    + eg "Harder Better Faster Stronger" by Daft Punk (EDM) is incorrectly classified as Pop by the partial model, but incorrectly classified as Rap by the full model.
+ 2b. on the rare chance both models incorrectly predict Pop, the expanded model seems 'less' wrong because its more specific
+    + eg "I was Made for Lovin' You" by KISS (Rock) is classified as Pop by the partial model. seems like a bit of a stretch. However, the full model classifies as Oldies and suddenly it seems less wrong.
+ 3. funnily enough the full model will also disagree when the partial model if it determines a song to not be Pop.
+    + eg "Bartender" by T-Pain (Rap) is correctly classified by the partial model, but incorrectly classified as Pop by the full model.
+ 4. the full model also seems to be more likely to predict country music is EDM
+    + eg "There Goes My Life" by Kenny Chesney (Country) classified Rock by partial, EDM by full
+    + eg "Before He Chears" by Carrie Underwood (Country) classified Country by partial, EDM by full
+    
+conclusions:
+by sheer score, the partial model will win because things are more general
+if we were to consider "distance" i think the full model might be slightly better, other than the EDM thing
+the full model is definitely a snob for pop music
+
+well would we have better pop subgenre selection if we were to ONLY train using pop data?
+
+```{r, LDA3 function}
+myLDA3 <- function(data, triplet=1, seed=8675309) { #take out multiples of 3 due to 3 subsets of Pop
+  set.seed(seed)
+  
+  genres <- c("Pop","K-Pop","Oldies")
+  testindex <- NULL
+  
+  for (i in 1:length(genres)){
+      testindex <- c(testindex,sample(which(full.dat$Genre==genres[i]),triplet))
+  }
+
+  testdat <- data[testindex,]
+  dat <- data[-testindex,]
+  
+  output <- lda(Genre~.,dat)
+  
+  output <- cbind(artist.dat[testindex,],predict(output, newdata=testdat)$class,data$Genre[testindex])
+  output <- cbind(output,output[,3] == output[,4])
+  colnames(output)[3:5] <- c("Predicted", "Actual", "Accuracy")
+  output
+}
+```
+
+```{r, LDA3 triple compare function}
+LDA3compare <- function(lda1,lda2,lda3){ # assumes same seed and underlying observations
+  output <- cbind(lda1[,1:3],lda2[,3],lda3[,3:4],Accuracy=NA)
+  val1 <- as.numeric(lda1[,5])+1
+  val2 <- as.numeric(lda2[,5])+3
+  val3 <- as.numeric(lda3[,5])+5
+  output$Accuracy[val1*val2*val3==15] <- "None"
+  output$Accuracy[val1*val2*val3==30] <- "1 Only"
+  output$Accuracy[val1*val2*val3==20] <- "2 Only"
+  output$Accuracy[val1*val2*val3==18] <- "3 Only"
+  output$Accuracy[val1*val2*val3==40] <- "1 & 2"
+  output$Accuracy[val1*val2*val3==24] <- "2 & 3"
+  output$Accuracy[val1*val2*val3==36] <- "1 & 3"
+  output$Accuracy[val1*val2*val3==48] <- "All"
+  colnames(output)[c(3,4,5)] <- c("Partial1","Full2","Pop3")
+  output
+}
+```
+
+```{r, LDA3 random testing}
+myseed=sample(1:10000,1) # so we can have the same test data for both partial and full models
+
+partial.lda <- myLDA3(partial.dat, triplet=2, seed=myseed) # make sure 'triplet' param same for both
+full.lda <- myLDA3(full.dat, triplet=2, seed=myseed)
+pop.lda <- myLDA3(pop.dat, triplet=2, seed=myseed)
+
+mysums <- c(sum(partial.lda$Accuracy),sum(full.lda$Accuracy),sum(pop.lda$Accuracy))
+mypcts <- round(mysums/c(nrow(partial.lda),nrow(full.lda),nrow(pop.lda)),4)
+mytable <- rbind(no.Correct=mysums,pct.Correct=mypcts)
+
+kable(LDA3compare(partial.lda,full.lda,pop.lda))
+mytable
+```
+
+hypothesis: K-Pop is ruining everything. maybe its not even a "real" genre. check lda scalings to verify
+
+```{r, lda scalings}
+pop.manova <- manova(as.matrix(pop.dat[,-10])~pop.dat$Genre)
+summary(pop.manova) # for all 9 variables, it apparently is
+summary(aov(as.matrix(pop.dat[,-10])~pop.dat$Genre))
+# no significant differences @ 5%: danceability, acousticness, tempo, duration
+
+# retry this for all 3 combinations of 2 subgenres of pop?
+pop.manova1 <- manova(as.matrix(pop.dat[pop.dat$Genre %in% c("Pop","K-Pop"),-10])~as.matrix(pop.dat[pop.dat$Genre %in% c("Pop","K-Pop"),10]))
+pop.manova2 <- manova(as.matrix(pop.dat[pop.dat$Genre %in% c("Pop","Oldies"),-10])~as.matrix(pop.dat[pop.dat$Genre %in% c("Pop","Oldies"),10]))
+pop.manova3 <- manova(as.matrix(pop.dat[pop.dat$Genre %in% c("Oldies","K-Pop"),-10])~as.matrix(pop.dat[pop.dat$Genre %in% c("Oldies","K-Pop"),10]))
+
+summary(pop.manova1) # Pop vs K-Pop p-value: 0.01387
+summary(pop.manova2) # Pop vs Oldies p-value: 1.784e-06
+summary(pop.manova3) # Oldies vs K-Pop p-value: 0.002293
+```
+
+```{r, LDA scalings for pop only}
+pop.lda <- lda(Genre~., dat=pop.dat)
+
+ggplot(data = as.data.frame(predict(pop.lda)$x),mapping=aes(x=LD1, y=LD2)) +
+  geom_point(mapping=aes(color=pop.dat$Genre)) +
+  scale_color_discrete(name="Genre") +
+  ggtitle("Pop Model LDA Predictions")
+```
+
+K-Pop definitely seems to be the weak link here
+
+```{r, prelim remove kpop}
+nok.full.dat <- full.dat[full.dat$Genre!='K-Pop',]
+nok.partial.dat <- nok.full.dat
+nok.partial.dat$Genre[nok.full.dat$Genre=='Oldies'] <- 'Pop'
+
+nok.full.lda <- lda(Genre~.,nok.full.dat)
+nok.partial.lda <- lda(Genre~.,nok.partial.dat)
+
+confusion.nok.full <- table(Actual=nok.full.dat$Genre,Predicted=predict(nok.full.lda)$class)[-4,-4]
+confusion.nok.partial <- table(Actual=nok.partial.dat$Genre,Predicted=predict(nok.partial.lda)$class)[-c(4:5),-c(4:5)]
+
+cbind(confusion.full,Acc=round(diag(confusion.full)/rowSums(confusion.full),3))
+cbind(confusion.nok.full,Acc=round(diag(confusion.nok.full)/rowSums(confusion.nok.full),3))
+round(c(sum(diag(confusion.full))/nrow(full.dat),sum(diag(confusion.nok.full))/nrow(nok.full.dat)),3)  # accuracy rate, full vs full w/o k-pop
+
+cbind(confusion.partial,Acc=round(diag(confusion.partial)/rowSums(confusion.partial),3))
+cbind(confusion.nok.partial,Acc=round(diag(confusion.nok.partial)/rowSums(confusion.nok.partial),3))
+round(c(sum(diag(confusion.partial))/nrow(partial.dat),sum(diag(confusion.nok.partial))/nrow(nok.partial.dat)),3)  # accuracy rate, partial vs partial w/o k-pop
+```
+
+k-pop isn't a real genre tell your friends
+
+## FA
+```{r, fa}
+fa.full <- factanal(full.dat[,-c(10)],factors=4,scores="regression",rotation="promax")
+```
+
+write a function to tell me what i want so i can scroll less:
+
+```{r, fa cumulative variance and proportional variance calculation}
+favar <- function(dat, f=1, rot='promax') {
+  x <- factanal(dat,factors=f, scores="regression", rotation=rot)
+  chart <- data.frame()
+  for (i in 1:f){
+    chart[1,i] <- round(sum(x$loadings[,i]^2)/nrow(x$loadings),3)
+    if (i > 1){chart[2,i] <- chart[2,i-1] + chart[1,i]}
+    else {chart[2,i] <- chart[1,i] }
+  }
+  rownames(chart) <- c("Proportional Var", "Cumulative Var")
+  chart <- list(Variance = chart, PVal = as.numeric(x$PVAL))
+  chart
+}
+
+favar(full.dat[,-10], f=4)
+```
+
+remove 1 var at a time to compare var and pval just to see:
+
+```{r, fa removing 1 var at a time to compare}
+faremove <- function(dat, i=10, f=4) {
+favar(dat[,-i],f)
+}
+
+faselect <- function(dat){
+varchart <- matrix(0,nrow=10,ncol=4)
+pvalchart <- matrix(0,nrow=10,ncol=4)
+
+for(k in 1:4){
+  varchart[10,k] <-faremove(dat,i=10,f=k)$Variance[2,k]
+  pvalchart[10,k] <- round(faremove(dat,i=10,f=k)$PVal,3)
+}
+
+for (j in 1:9){
+  for (k in 1:4){
+    varchart[j,k] <- faremove(dat,i=c(j,10),f=k)$Variance[2,k]
+    pvalchart[j,k] <- round(faremove(dat,i=c(j,10),f=k)$PVal,3)
+  }
+}
+list("CumVar"=varchart,"PVal"=pvalchart)
+}
+
+```
